@@ -16,3 +16,4 @@ terraform.rc
 .terraformrc
 terragrunt.hcl
 .terragrunt-cache/
+scratch.txt

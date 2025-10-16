@@ -37,7 +37,8 @@ variable "bridge" {
 
 variable "template_vm_id" {
   type        = number
-  default     = 9002
+  default     = 9006
+  
   description = "VMID of the Windows 2022 template to clone"
 }
 variable "template_name" {

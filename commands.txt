@@ -1,0 +1,4 @@
+Sysprep:
+[powershell]
+$unatt = "$env:ProgramFiles\Cloudbase Solutions\Cloudbase-Init\conf\Unattend.xml"
+& "$env:WINDIR\System32\Sysprep\sysprep.exe" /generalize /oobe /shutdown /unattend:"$unatt"
