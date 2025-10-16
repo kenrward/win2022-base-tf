@@ -84,22 +84,94 @@ locals {
   member_cloudconfig = <<-CLOUD
     #cloud-config
     write_files:
-      - path: C:\\Windows\\Temp\\join_domain.ps1
+      - path: C:\\Windows\\Temp\\set_dns_and_join.ps1
         permissions: "0644"
         content: |
           [CmdletBinding()]
           param()
+
+          $dcDns = "192.168.86.201"
+          $domain = "${var.domain_fqdn}"
           $joinUser = "${var.domain_join_user}"
           $joinPass = ConvertTo-SecureString "${var.domain_join_pass}" -AsPlainText -Force
           $cred     = New-Object System.Management.Automation.PSCredential($joinUser, $joinPass)
-          $domain   = "${var.domain_fqdn}"
-          $maxTries = 40
-          for ($i=0; $i -lt $maxTries; $i++) {
-            try { Resolve-DnsName -Name $domain -ErrorAction Stop | Out-Null; break } catch { Start-Sleep -Seconds 15 }
+
+          function Get-PrimaryInterfaceIndex {
+            # Pick NIC tied to the default IPv4 route
+            $route = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+                     Sort-Object -Property RouteMetric, ifMetric -Descending:$false |
+                     Select-Object -First 1
+            if ($null -ne $route) { return $route.InterfaceIndex }
+            # Fallback: first "Up" NIC
+            return (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1 -ExpandProperty ifIndex)
           }
-          Add-Computer -DomainName $domain -Credential $cred -Force -Restart
+
+          $ifIndex = Get-PrimaryInterfaceIndex
+          if (-not $ifIndex) { Start-Sleep -Seconds 10; $ifIndex = Get-PrimaryInterfaceIndex }
+
+          # Force DNS to the DC (clear DHCP-provided DNS first)
+          try {
+            Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ResetServerAddresses -ErrorAction Stop
+            Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dcDns -ErrorAction Stop
+          } catch {
+            Write-Host "Failed to set DNS on ifIndex $ifIndex: $($_.Exception.Message)"
+          }
+
+          # Verify we can query the domain against the DC's DNS specifically
+          $max = 40
+          for ($i=0; $i -lt $max; $i++) {
+            try {
+              Resolve-DnsName -Server $dcDns -Name $domain -ErrorAction Stop | Out-Null
+              break
+            } catch {
+              Start-Sleep -Seconds 5
+            }
+          }
+
+          # Optional: install a startup task that re-applies DNS on reboot (removed after the box is domain-joined)
+          $fixScript = @"
+          \$dcDns = "$dcDns"
+          function Get-PrimaryInterfaceIndex {
+            \$route = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+                     Sort-Object -Property RouteMetric, ifMetric -Descending:\$false |
+                     Select-Object -First 1
+            if (\$null -ne \$route) { return \$route.InterfaceIndex }
+            return (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1 -ExpandProperty ifIndex)
+          }
+          try {
+            # If already domain-joined, remove task and quit
+            if ((Get-WmiObject Win32_ComputerSystem).PartOfDomain) {
+              schtasks /Delete /TN "ZN-FixDNS" /F | Out-Null
+              exit 0
+            }
+          } catch {}
+
+          \$ifIndex = Get-PrimaryInterfaceIndex
+          if (-not \$ifIndex) { exit 0 }
+          try {
+            Set-DnsClientServerAddress -InterfaceIndex \$ifIndex -ResetServerAddresses
+            Set-DnsClientServerAddress -InterfaceIndex \$ifIndex -ServerAddresses \$dcDns
+          } catch {}
+"@
+
+          $fixFile = "C:\\Windows\\Temp\\fix_dns_startup.ps1"
+          $fixScript | Out-File -FilePath $fixFile -Encoding UTF8 -Force
+
+          $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$fixFile`""
+          $trigger   = New-ScheduledTaskTrigger -AtStartup
+          $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+          Register-ScheduledTask -TaskName "ZN-FixDNS" -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+
+          # Attempt the join now that DNS is correct
+          try {
+            Add-Computer -DomainName $domain -Credential $cred -Force -Restart
+          } catch {
+            Write-Host "Join failed: $($_.Exception.Message)"
+            # Leave the startup task so DNS sticks across reboots; admin can retry the join.
+          }
+
     runcmd:
-      - powershell -NoLogo -NonInteractive -ExecutionPolicy Bypass -File C:\\Windows\\Temp\\join_domain.ps1
+      - powershell -NoLogo -NonInteractive -ExecutionPolicy Bypass -File C:\\Windows\\Temp\\set_dns_and_join.ps1
   CLOUD
 }
 
@@ -129,6 +201,11 @@ resource "proxmox_virtual_environment_file" "userdata_member" {
 # --- Create the 3 VMs by cloning the template ---
 resource "proxmox_virtual_environment_vm" "win" {
   for_each = local.vms
+
+  depends_on = [
+    proxmox_virtual_environment_file.userdata_dc,
+    proxmox_virtual_environment_file.userdata_member,
+  ]
 
   name      = each.key
   node_name = var.node_name
